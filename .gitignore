@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+error.log
+claude_response.log
+.streamlit/secrets.toml
