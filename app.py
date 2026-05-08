@@ -902,11 +902,18 @@ with tab1:
 
     # ショートポイント
     if shortage:
-        fig_cf.add_vline(
-            x=shortage["日付"], line_dash="dot", line_color="#EF4444", line_width=2,
-            annotation_text=f"⚠ ショート",
-            annotation_position="top",
-            annotation_font={"color": "#EF4444"},
+        fig_cf.add_shape(
+            type="line",
+            x0=shortage["日付"], x1=shortage["日付"],
+            y0=0, y1=1, yref="paper",
+            line=dict(color="#EF4444", width=2, dash="dot"),
+        )
+        fig_cf.add_annotation(
+            x=shortage["日付"], y=1.0, yref="paper",
+            text="⚠ ショート", showarrow=False,
+            font=dict(color="#EF4444", size=12),
+            yshift=15,
+            bgcolor="rgba(15, 20, 25, 0.8)",
         )
 
     fig_cf.update_layout(
