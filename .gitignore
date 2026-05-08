@@ -1,7 +1,21 @@
+# 環境変数・APIキー
 .env
+.env.*
+
+# ログファイル
+*.log
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-error.log
-claude_response.log
+.venv/
+venv/
+env/
+
+# Streamlit
 .streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db

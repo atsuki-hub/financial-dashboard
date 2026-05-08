@@ -22,7 +22,7 @@
 
 ## デモ
 
-[▶ Streamlit Cloud でデモを見る](https://your-app-url.streamlit.app)
+> デプロイ後にStreamlit CloudのURLを記載予定
 
 ## 技術スタック
 
@@ -36,7 +36,7 @@
 
 ```bash
 # リポジトリをクローン
-git clone https://github.com/your-username/financial-dashboard.git
+git clone https://github.com/<your-username>/financial-dashboard.git
 cd financial-dashboard
 
 # 依存関係をインストール

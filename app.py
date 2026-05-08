@@ -203,10 +203,6 @@ def extract_financials_from_pdf(pdf_file) -> pd.Series:
     )
     raw = message.content[0].text.strip()
 
-    # デバッグ用にClaudeの返答をログに残す
-    with open("claude_response.log", "w", encoding="utf-8") as f:
-        f.write(raw)
-
     # コードブロックを除去
     if "```" in raw:
         for part in raw.split("```"):
@@ -530,10 +526,7 @@ with tab1:
                     except Exception as e:
                         import traceback
                         tb = traceback.format_exc()
-                        # ログファイルに書き出す
-                        with open("error.log", "w", encoding="utf-8") as f:
-                            f.write(tb)
-                        st.error("読み取りエラーが発生しました。error.logに詳細を書き出しました。")
+                        st.error("読み取りエラーが発生しました。")
                         st.code(tb, language="text")
             if st.session_state.get("pdf_extracted") is not None:
                 with st.expander("抽出されたデータを確認・補完する"):
