@@ -5,7 +5,8 @@ import json
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from io import StringIO
+from io import StringIO, BytesIO
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 import anthropic
 import fitz
@@ -82,10 +83,10 @@ st.markdown("""
 st.markdown("""
 <div class="lp-hero">
   <span class="lp-tag">CFO COCKPIT</span>
-  <h1 style="margin:0; font-size:2rem;">中小企業オーナーのための財務分析ダッシュボード</h1>
+  <h1 style="margin:0; font-size:2rem;">経営者の「眠れない夜」を解消する資金繰りダッシュボード</h1>
   <p style="color:#9CA3AF; margin-top:8px; font-size:1rem;">
-    年商1〜5億円の事業に最適化。試算表PDFをアップロードするだけで、
-    KPI診断・トレンド分析・経営シミュレーションを一気通貫で行います。
+    年商1〜5億円の中小企業オーナー向け。3ヶ月先までの資金ショートを先回りで検知し、
+    原因と打ち手まで提示。会計ソフトでは届かない「経営判断のラストワンマイル」を埋めます。
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -335,14 +336,231 @@ def generate_ai_comment(kpis, industry, bm, memo=""):
 
 
 # ==============================
-# タブ
+# 資金繰り：サンプルデータ
 # ==============================
-tab1, tab2, tab3 = st.tabs(["KPI診断", "月次推移分析", "What-if シミュレーション"])
+def _today():
+    return datetime.now().date()
+
+def _make_sample_cashflow():
+    t = _today()
+    receivables = pd.DataFrame([
+        {"取引先": "A社", "金額": 800000,  "予定日": t + timedelta(days=12)},
+        {"取引先": "B社", "金額": 1200000, "予定日": t + timedelta(days=18)},
+        {"取引先": "C社", "金額": 500000,  "予定日": t + timedelta(days=25)},
+        {"取引先": "D社", "金額": 1500000, "予定日": t + timedelta(days=35)},
+        {"取引先": "E社", "金額": 900000,  "予定日": t + timedelta(days=50)},
+        {"取引先": "F社", "金額": 1100000, "予定日": t + timedelta(days=65)},
+    ])
+    payables = pd.DataFrame([
+        {"科目": "外注費A",      "金額": 600000,  "予定日": t + timedelta(days=8)},
+        {"科目": "機材購入",     "金額": 1500000, "予定日": t + timedelta(days=20)},
+        {"科目": "法人税中間",   "金額": 800000,  "予定日": t + timedelta(days=40)},
+        {"科目": "外注費B",      "金額": 400000,  "予定日": t + timedelta(days=55)},
+    ])
+    recurring = pd.DataFrame([
+        {"科目": "家賃",         "金額": 380000,  "支払日": 25},
+        {"科目": "人件費",       "金額": 4500000, "支払日": 25},
+        {"科目": "通信費",       "金額": 50000,   "支払日": 27},
+        {"科目": "水道光熱費",   "金額": 80000,   "支払日": 28},
+    ])
+    return 3500000, receivables, payables, recurring
+
 
 # ==============================
-# TAB 1: KPI診断
+# 資金繰り：日次残高シミュレーター
 # ==============================
-with tab1:
+def build_daily_balance(start_balance, receivables, payables, recurring,
+                         days=90, delay_days=0, extra_amount=0, extra_day=0):
+    """
+    指定期間の日次残高を計算する。
+    delay_days: 全入金予定をN日後ろにずらす（シナリオ分析）
+    extra_amount, extra_day: 指定日（今日からN日後）に追加支出を発生させる
+    """
+    today = _today()
+    rows = []
+    balance = float(start_balance)
+
+    for i in range(days + 1):
+        d = today + timedelta(days=i)
+        income = 0.0
+        expense = 0.0
+        income_detail = []
+        expense_detail = []
+
+        if not receivables.empty:
+            for _, r in receivables.iterrows():
+                scheduled = pd.to_datetime(r["予定日"]).date()
+                actual = scheduled + timedelta(days=int(delay_days))
+                if actual == d:
+                    income += float(r["金額"])
+                    income_detail.append(f"{r['取引先']} {int(r['金額']):,}円")
+
+        if not payables.empty:
+            for _, p in payables.iterrows():
+                if pd.to_datetime(p["予定日"]).date() == d:
+                    expense += float(p["金額"])
+                    expense_detail.append(f"{p['科目']} {int(p['金額']):,}円")
+
+        if not recurring.empty:
+            for _, rec in recurring.iterrows():
+                if d.day == int(rec["支払日"]) and i > 0:  # 今日の固定支出は出ない
+                    expense += float(rec["金額"])
+                    expense_detail.append(f"{rec['科目']} {int(rec['金額']):,}円")
+
+        if extra_amount > 0 and i == int(extra_day):
+            expense += float(extra_amount)
+            expense_detail.append(f"想定外支出 {int(extra_amount):,}円")
+
+        balance += income - expense
+        rows.append({
+            "日付": d, "残高": balance,
+            "入金": income, "支出": expense,
+            "入金内訳": " / ".join(income_detail) if income_detail else "",
+            "支出内訳": " / ".join(expense_detail) if expense_detail else "",
+        })
+    return pd.DataFrame(rows)
+
+
+def detect_shortage(df_balance):
+    """残高がマイナスに沈む最初の日を返す"""
+    neg = df_balance[df_balance["残高"] < 0]
+    if neg.empty:
+        return None
+    first = neg.iloc[0]
+    return {"日付": first["日付"], "残高": first["残高"], "支出内訳": first["支出内訳"]}
+
+
+def calc_risk_rank(df_balance, monthly_baseline):
+    """ランクA〜E + 評価コメント"""
+    shortage = detect_shortage(df_balance)
+    today = _today()
+
+    if shortage:
+        days_to = (shortage["日付"] - today).days
+        if days_to <= 30:
+            return "E", "🚨 30日以内に資金ショートの恐れ。即時対応が必要です。"
+        elif days_to <= 60:
+            return "D", "⚠ 60日以内にショート見込み。早期の手当を推奨します。"
+        else:
+            return "D", "⚠ 90日以内にショート見込み。対応策の検討を始めてください。"
+
+    min_balance = float(df_balance["残高"].min())
+    if monthly_baseline > 0:
+        ratio = min_balance / monthly_baseline
+        if ratio >= 1.0:
+            return "A", "✓ 資金繰り良好。月商1ヶ月分以上の余裕があります。"
+        elif ratio >= 0.5:
+            return "B", "✓ 概ね健全。月商0.5〜1ヶ月分の余裕があります。"
+        else:
+            return "C", "△ 余裕が薄い。月商0.5ヶ月分未満の最低残高で要注意。"
+    return "B", "✓ ショートなし。"
+
+
+def rule_based_advice(df_balance, receivables, payables, recurring, balance):
+    """ルールベースのCFO的助言（最大3件）"""
+    advice = []
+    shortage = detect_shortage(df_balance)
+    today = _today()
+
+    # 1. ショート対応
+    if shortage:
+        d = shortage["日付"]
+        days_to = (d - today).days
+        # その日までの最大支出を特定
+        target_day = df_balance[df_balance["日付"] == d].iloc[0]
+        if target_day["支出内訳"]:
+            advice.append(
+                f"**【最優先】{d.strftime('%m月%d日')}（あと{days_to}日）にショート見込み**。"
+                f"主要因: {target_day['支出内訳']}。"
+                f"この支払いの分割交渉、または同日までの早期入金確保（請求前倒し・前金受領）を検討してください。"
+            )
+        # 必要資金額
+        need = abs(int(shortage["残高"])) + 500000  # バッファ50万
+        advice.append(
+            f"**【手当の選択肢】** ショート回避には約 **{need:,}円** の追加資金が必要。"
+            f"短期借入（当座借越・手形貸付）/ ファクタリング / 経営者借入 から選択を。"
+        )
+
+    # 2. 売掛金の集中リスク
+    if not receivables.empty:
+        total_recv = receivables["金額"].sum()
+        max_recv = receivables["金額"].max()
+        if total_recv > 0 and max_recv / total_recv >= 0.4:
+            top = receivables.loc[receivables["金額"].idxmax()]
+            advice.append(
+                f"**【取引先集中リスク】** {top['取引先']}の入金（{int(top['金額']):,}円）が"
+                f"全入金の{max_recv/total_recv*100:.0f}%を占めています。"
+                f"この1社の遅延・倒産が致命傷になる構造。取引先分散の検討を。"
+            )
+
+    # 3. 固定費負担の警告
+    if not recurring.empty and balance > 0:
+        monthly_fixed = recurring["金額"].sum()
+        if monthly_fixed > balance * 0.4:
+            advice.append(
+                f"**【固定費過重】** 月次固定費 **{int(monthly_fixed):,}円** が"
+                f"現在残高の{monthly_fixed/balance*100:.0f}%。"
+                f"売上が1ヶ月止まると {int(balance/monthly_fixed*30):,}日で資金が枯渇します。"
+            )
+
+    # 4. ポジティブな所見（健全な場合）
+    if not advice:
+        min_balance = float(df_balance["残高"].min())
+        advice.append(
+            f"**【現状評価】** 90日先までショートなし。最低残高 **{int(min_balance):,}円**。"
+            f"この余裕を活かして、設備投資・人材投資・営業強化への戦略的支出を検討する好機です。"
+        )
+
+    return advice[:3]
+
+
+def export_cashflow_csv(balance, receivables, payables, recurring):
+    rows = [{"type": "balance", "name": "", "amount": int(balance), "date": "", "day": ""}]
+    for _, r in receivables.iterrows():
+        rows.append({"type": "receivable", "name": r["取引先"], "amount": int(r["金額"]),
+                     "date": pd.to_datetime(r["予定日"]).strftime("%Y-%m-%d"), "day": ""})
+    for _, p in payables.iterrows():
+        rows.append({"type": "payable", "name": p["科目"], "amount": int(p["金額"]),
+                     "date": pd.to_datetime(p["予定日"]).strftime("%Y-%m-%d"), "day": ""})
+    for _, rec in recurring.iterrows():
+        rows.append({"type": "recurring", "name": rec["科目"], "amount": int(rec["金額"]),
+                     "date": "", "day": int(rec["支払日"])})
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+
+
+def import_cashflow_csv(file):
+    df = pd.read_csv(file)
+    balance = 0.0
+    recv, pay, rec = [], [], []
+    for _, row in df.iterrows():
+        t = str(row.get("type", "")).strip()
+        amt = float(row.get("amount", 0) or 0)
+        name = str(row.get("name", "") or "")
+        if t == "balance":
+            balance = amt
+        elif t == "receivable":
+            recv.append({"取引先": name, "金額": amt,
+                         "予定日": pd.to_datetime(row["date"]).date()})
+        elif t == "payable":
+            pay.append({"科目": name, "金額": amt,
+                        "予定日": pd.to_datetime(row["date"]).date()})
+        elif t == "recurring":
+            rec.append({"科目": name, "金額": amt, "支払日": int(row["day"])})
+    return (balance,
+            pd.DataFrame(recv) if recv else pd.DataFrame(columns=["取引先", "金額", "予定日"]),
+            pd.DataFrame(pay) if pay else pd.DataFrame(columns=["科目", "金額", "予定日"]),
+            pd.DataFrame(rec) if rec else pd.DataFrame(columns=["科目", "金額", "支払日"]))
+
+
+# ==============================
+# タブ
+# ==============================
+tab1, tab2, tab3 = st.tabs(["💰 資金繰り3ヶ月先見", "📊 KPI診断", "🔬 What-if"])
+
+# ==============================
+# TAB 2: KPI診断
+# ==============================
+with tab2:
     with st.sidebar:
         st.markdown("### データ入力")
         input_method = st.radio(
@@ -518,114 +736,274 @@ with tab1:
 
 
 # ==============================
-# TAB 2: 月次推移分析
+# TAB 1: 資金繰り3ヶ月先見（KILLER FEATURE）
 # ==============================
-with tab2:
-    st.markdown("#### 月次推移分析")
-    st.caption("12ヶ月分の月次データから、トレンド・季節性・異常値を可視化します。")
+with tab1:
+    st.markdown("#### 資金繰り3ヶ月先見")
+    st.caption("売掛金の入金予定・支払予定・固定費から、先90日の現金残高をシミュレーション。"
+               "ショートポイントの自動検出と打ち手の提示まで行います。")
 
-    use_sample_monthly = st.toggle("サンプル月次データを使用", value=True, key="toggle_monthly")
+    # 初期化
+    if "cf_balance" not in st.session_state:
+        b, r, p, rec = _make_sample_cashflow()
+        st.session_state["cf_balance"] = b
+        st.session_state["cf_recv"] = r
+        st.session_state["cf_pay"] = p
+        st.session_state["cf_rec"] = rec
 
-    if use_sample_monthly:
-        monthly_data = SAMPLE_MONTHLY
-    else:
-        st.markdown("**月次データを入力**")
-        rows = []
-        cols = st.columns(4)
-        for i in range(1, 13):
-            col = cols[(i - 1) % 4]
-            with col:
-                rev = st.number_input(f"{i}月 売上高", value=int(SAMPLE_MONTHLY[i]["売上高"]),
-                                       step=100000, key=f"rev_{i}")
-                cogs = st.number_input(f"{i}月 売上原価", value=int(SAMPLE_MONTHLY[i]["売上原価"]),
-                                        step=100000, key=f"cogs_{i}")
-                sga = st.number_input(f"{i}月 販管費", value=int(SAMPLE_MONTHLY[i]["販売費及び一般管理費"]),
-                                       step=100000, key=f"sga_{i}")
-                rows.append((i, rev, cogs, sga))
-        monthly_data = {i: {"売上高": r, "売上原価": c, "販売費及び一般管理費": s}
-                        for i, r, c, s in rows}
+    # === ヘッダーアクション ===
+    act_c1, act_c2, act_c3, act_c4 = st.columns([1, 1, 1, 2])
+    with act_c1:
+        if st.button("サンプル読込", use_container_width=True, key="cf_sample"):
+            b, r, p, rec = _make_sample_cashflow()
+            st.session_state["cf_balance"] = b
+            st.session_state["cf_recv"] = r
+            st.session_state["cf_pay"] = p
+            st.session_state["cf_rec"] = rec
+            st.rerun()
+    with act_c2:
+        csv_bytes = export_cashflow_csv(
+            st.session_state["cf_balance"], st.session_state["cf_recv"],
+            st.session_state["cf_pay"], st.session_state["cf_rec"],
+        )
+        st.download_button(
+            "CSV エクスポート", data=csv_bytes,
+            file_name=f"cashflow_{_today().strftime('%Y%m%d')}.csv",
+            mime="text/csv", use_container_width=True, key="cf_export",
+        )
+    with act_c3:
+        upl = st.file_uploader("CSVインポート", type=["csv"], key="cf_import",
+                                label_visibility="collapsed")
+        if upl is not None:
+            try:
+                b, r, p, rec = import_cashflow_csv(upl)
+                st.session_state["cf_balance"] = b
+                st.session_state["cf_recv"] = r
+                st.session_state["cf_pay"] = p
+                st.session_state["cf_rec"] = rec
+                st.success("CSVを取り込みました")
+            except Exception as e:
+                st.error(f"取り込みエラー: {e}")
 
-    months = sorted(monthly_data.keys())
-    revenue = [monthly_data[m]["売上高"] for m in months]
-    cogs_arr = [monthly_data[m]["売上原価"] for m in months]
-    sga_arr = [monthly_data[m]["販売費及び一般管理費"] for m in months]
-    op_profit = [r - c - s for r, c, s in zip(revenue, cogs_arr, sga_arr)]
+    # === データ入力（折りたたみ） ===
+    with st.expander("📝 データを入力・編集する", expanded=False):
+        in_c1, in_c2 = st.columns([1, 3])
+        with in_c1:
+            new_bal = st.number_input(
+                "現在の現金残高（円）",
+                value=int(st.session_state["cf_balance"]),
+                step=100000, format="%d", key="cf_balance_input",
+            )
+            st.session_state["cf_balance"] = new_bal
 
-    df_m = pd.DataFrame({
-        "月": [f"{m}月" for m in months],
-        "売上高": revenue, "売上原価": cogs_arr, "販管費": sga_arr,
-        "営業利益": op_profit,
-    })
+        st.markdown("**入金予定（売掛金）**")
+        edited_recv = st.data_editor(
+            st.session_state["cf_recv"], num_rows="dynamic", use_container_width=True,
+            column_config={
+                "金額": st.column_config.NumberColumn("金額（円）", format="%d", step=100000),
+                "予定日": st.column_config.DateColumn("予定日"),
+            },
+            key="cf_recv_editor",
+        )
+        st.session_state["cf_recv"] = edited_recv
 
-    # ====== サマリー ======
-    total_rev = sum(revenue)
-    total_op = sum(op_profit)
-    avg_rev = total_rev / len(months)
-    op_margin = (total_op / total_rev * 100) if total_rev else 0
+        st.markdown("**支払予定（一回限り）**")
+        edited_pay = st.data_editor(
+            st.session_state["cf_pay"], num_rows="dynamic", use_container_width=True,
+            column_config={
+                "金額": st.column_config.NumberColumn("金額（円）", format="%d", step=100000),
+                "予定日": st.column_config.DateColumn("予定日"),
+            },
+            key="cf_pay_editor",
+        )
+        st.session_state["cf_pay"] = edited_pay
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("年間売上", fmt_yen(total_rev))
-    c2.metric("年間営業利益", fmt_yen(total_op), f"{op_margin:.1f}%")
-    c3.metric("月平均売上", fmt_yen(avg_rev))
-    c4.metric("最高/最低月", f"{months[revenue.index(max(revenue))]}月 / {months[revenue.index(min(revenue))]}月")
+        st.markdown("**定期支出（毎月）**")
+        edited_rec = st.data_editor(
+            st.session_state["cf_rec"], num_rows="dynamic", use_container_width=True,
+            column_config={
+                "金額": st.column_config.NumberColumn("金額（円）", format="%d", step=10000),
+                "支払日": st.column_config.NumberColumn("支払日（毎月）", min_value=1, max_value=31, step=1),
+            },
+            key="cf_rec_editor",
+        )
+        st.session_state["cf_rec"] = edited_rec
 
+    # === 計算 ===
+    df_balance = build_daily_balance(
+        st.session_state["cf_balance"],
+        st.session_state["cf_recv"], st.session_state["cf_pay"], st.session_state["cf_rec"],
+        days=90,
+    )
+    shortage = detect_shortage(df_balance)
+
+    # 月商ベースライン（3ヶ月入金合計÷3）
+    monthly_baseline = float(st.session_state["cf_recv"]["金額"].sum()) / 3 if not st.session_state["cf_recv"].empty else 0
+    rank, rank_msg = calc_risk_rank(df_balance, monthly_baseline)
+
+    # === ショートアラート（最上部に固定表示） ===
+    if shortage:
+        days_to = (shortage["日付"] - _today()).days
+        st.error(
+            f"## 🚨 ショート警告：{shortage['日付'].strftime('%Y年%m月%d日')}（あと{days_to}日）\n\n"
+            f"残高見込み: **{int(shortage['残高']):,}円**　／　主要因: {shortage['支出内訳']}"
+        )
+
+    # === サマリーカード ===
+    sm_c1, sm_c2, sm_c3, sm_c4 = st.columns(4)
+    min_balance = float(df_balance["残高"].min())
+    min_day = df_balance.loc[df_balance["残高"].idxmin(), "日付"]
+    end_balance = float(df_balance["残高"].iloc[-1])
+
+    rank_color = {"A": "#10B981", "B": "#5EAFFF", "C": "#F59E0B", "D": "#F97316", "E": "#EF4444"}[rank]
+
+    sm_c1.metric("現在残高", fmt_yen(st.session_state["cf_balance"]))
+    sm_c2.metric("最低残高（90日内）", fmt_yen(min_balance),
+                 f"{min_day.strftime('%m/%d')}",
+                 delta_color="inverse" if min_balance < 0 else "off")
+    sm_c3.metric("90日後残高", fmt_yen(end_balance),
+                 f"{(end_balance - st.session_state['cf_balance'])/10000:+,.0f}万円")
+    sm_c4.markdown(
+        f"<div style='background:{rank_color}; padding:14px; border-radius:6px; "
+        f"text-align:center; margin-top:8px;'>"
+        f"<div style='color:#0F1419; font-size:0.75rem; font-weight:600; letter-spacing:0.1em;'>RISK RANK</div>"
+        f"<div style='color:#0F1419; font-size:2.5rem; font-weight:700; line-height:1;'>{rank}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.caption(rank_msg)
     st.divider()
 
-    # ====== 推移グラフ ======
-    st.markdown("#### 売上・利益の推移")
+    # === 残高推移グラフ ===
+    st.markdown("#### 日次残高シミュレーション（先90日）")
 
-    # 移動平均
-    ma3 = pd.Series(revenue).rolling(3, min_periods=1).mean()
+    fig_cf = go.Figure()
+    fig_cf.add_trace(go.Scatter(
+        x=df_balance["日付"], y=df_balance["残高"],
+        mode="lines", name="残高",
+        line={"color": "#5EAFFF", "width": 2.5},
+        fill="tozeroy", fillcolor="rgba(94, 175, 255, 0.12)",
+        hovertemplate="<b>%{x|%Y-%m-%d}</b><br>残高: %{y:,.0f}円<extra></extra>",
+    ))
+    # ゼロライン
+    fig_cf.add_hline(y=0, line_dash="dash", line_color="#EF4444", line_width=1.5)
 
-    fig_t = go.Figure()
-    fig_t.add_trace(go.Bar(x=df_m["月"], y=revenue, name="売上高",
-                            marker_color="#5EAFFF", opacity=0.8))
-    fig_t.add_trace(go.Scatter(x=df_m["月"], y=ma3, name="3ヶ月移動平均",
-                                line={"color": "#F59E0B", "width": 2, "dash": "dot"},
-                                mode="lines+markers"))
-    fig_t.add_trace(go.Scatter(x=df_m["月"], y=op_profit, name="営業利益",
-                                line={"color": "#10B981", "width": 2.5},
-                                mode="lines+markers", yaxis="y2"))
-    fig_t.update_layout(
+    # 大型支出マーカー
+    big_expenses = df_balance[df_balance["支出"] >= 500000]
+    if not big_expenses.empty:
+        fig_cf.add_trace(go.Scatter(
+            x=big_expenses["日付"], y=big_expenses["残高"],
+            mode="markers", name="主な支出日",
+            marker={"size": 10, "color": "#F59E0B", "symbol": "triangle-down"},
+            customdata=big_expenses[["支出", "支出内訳"]].values,
+            hovertemplate="<b>%{x|%Y-%m-%d}</b><br>支出: %{customdata[0]:,.0f}円<br>%{customdata[1]}<extra></extra>",
+        ))
+
+    # ショートポイント
+    if shortage:
+        fig_cf.add_vline(
+            x=shortage["日付"], line_dash="dot", line_color="#EF4444", line_width=2,
+            annotation_text=f"⚠ ショート",
+            annotation_position="top",
+            annotation_font={"color": "#EF4444"},
+        )
+
+    fig_cf.update_layout(
         height=420,
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#1A1F2B",
         font={"color": "#E5E7EB"},
+        xaxis={"gridcolor": "#2A2F3A", "title": ""},
+        yaxis={"gridcolor": "#2A2F3A", "title": "残高（円）", "tickformat": ",.0f"},
+        legend={"bgcolor": "rgba(0,0,0,0)", "orientation": "h", "y": 1.08},
+        margin=dict(t=40, b=20, l=10, r=10),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_cf, use_container_width=True)
+
+    st.divider()
+
+    # === シナリオ分析 ===
+    st.markdown("#### シナリオ分析")
+    st.caption("「もし入金が遅れたら」「予期せぬ支出が出たら」を試算できます。")
+
+    sc_c1, sc_c2 = st.columns(2)
+    with sc_c1:
+        st.markdown("**入金遅延シナリオ**")
+        delay_days = st.slider(
+            "全入金が ◯日遅れたら", 0, 60, 0, step=1, key="cf_delay",
+            help="主要取引先の支払い遅延を想定したシミュレーション",
+        )
+    with sc_c2:
+        st.markdown("**予期せぬ支出シナリオ**")
+        ex_amt_man = st.slider(
+            "想定外支出（万円）", 0, 1000, 0, step=10, key="cf_ex_amt",
+        )
+        ex_day = st.slider(
+            "発生する日（今日からN日後）", 1, 90, 30, step=1, key="cf_ex_day",
+            disabled=(ex_amt_man == 0),
+        )
+
+    df_scenario = build_daily_balance(
+        st.session_state["cf_balance"],
+        st.session_state["cf_recv"], st.session_state["cf_pay"], st.session_state["cf_rec"],
+        days=90, delay_days=delay_days,
+        extra_amount=ex_amt_man * 10000, extra_day=ex_day,
+    )
+    scenario_shortage = detect_shortage(df_scenario)
+
+    # 比較グラフ
+    fig_sc = go.Figure()
+    fig_sc.add_trace(go.Scatter(
+        x=df_balance["日付"], y=df_balance["残高"],
+        mode="lines", name="現状",
+        line={"color": "#6B7280", "width": 2, "dash": "dot"},
+    ))
+    fig_sc.add_trace(go.Scatter(
+        x=df_scenario["日付"], y=df_scenario["残高"],
+        mode="lines", name="シナリオ後",
+        line={"color": "#F59E0B", "width": 2.5},
+        fill="tozeroy", fillcolor="rgba(245, 158, 11, 0.12)",
+    ))
+    fig_sc.add_hline(y=0, line_dash="dash", line_color="#EF4444")
+    fig_sc.update_layout(
+        height=350,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#1A1F2B",
+        font={"color": "#E5E7EB"},
         xaxis={"gridcolor": "#2A2F3A"},
-        yaxis={"title": "売上高（円）", "gridcolor": "#2A2F3A"},
-        yaxis2={"title": "営業利益（円）", "overlaying": "y", "side": "right",
-                "gridcolor": "rgba(0,0,0,0)"},
+        yaxis={"gridcolor": "#2A2F3A", "title": "残高（円）", "tickformat": ",.0f"},
         legend={"bgcolor": "rgba(0,0,0,0)", "orientation": "h", "y": 1.1},
         margin=dict(t=40, b=20, l=10, r=10),
     )
-    st.plotly_chart(fig_t, use_container_width=True)
+    st.plotly_chart(fig_sc, use_container_width=True)
 
-    # ====== 異常値検知 ======
-    avg = sum(revenue) / len(revenue)
-    std = (sum((r - avg) ** 2 for r in revenue) / len(revenue)) ** 0.5
-    anomalies = [(months[i], revenue[i]) for i in range(len(revenue))
-                  if abs(revenue[i] - avg) > 1.5 * std]
+    sc_msg_c1, sc_msg_c2 = st.columns(2)
+    sc_msg_c1.metric(
+        "シナリオ後 最低残高",
+        fmt_yen(float(df_scenario["残高"].min())),
+        f"{(float(df_scenario['残高'].min()) - min_balance)/10000:+,.0f}万円 vs 現状",
+        delta_color="inverse",
+    )
+    if scenario_shortage and not shortage:
+        sc_msg_c2.error(f"⚠ このシナリオでは {scenario_shortage['日付'].strftime('%m/%d')} にショート")
+    elif scenario_shortage and shortage:
+        diff_days = (scenario_shortage["日付"] - shortage["日付"]).days
+        sc_msg_c2.warning(f"ショート日が {abs(diff_days)}日 {'後ろ倒し' if diff_days > 0 else '前倒し'}")
+    else:
+        sc_msg_c2.success("✓ このシナリオでもショートなし")
 
-    if anomalies:
-        st.markdown("#### 異常値の検知")
-        for m, v in anomalies:
-            direction = "↑ 高水準" if v > avg else "↓ 低水準"
-            st.warning(f"**{m}月**: {fmt_yen(v)} ({direction} / 平均比 {(v/avg-1)*100:+.1f}%)")
-
-    # ====== 着地予測 ======
     st.divider()
-    st.markdown("#### 着地予測")
-    st.caption("直近3ヶ月の平均から、年間着地を試算します。")
 
-    if len(months) >= 3:
-        recent_avg_rev = sum(revenue[-3:]) / 3
-        recent_avg_op = sum(op_profit[-3:]) / 3
-        forecast_rev = sum(revenue) + recent_avg_rev * (12 - len(months)) if len(months) < 12 else sum(revenue)
-        forecast_op = sum(op_profit) + recent_avg_op * (12 - len(months)) if len(months) < 12 else sum(op_profit)
+    # === ルールベース CFOアドバイス ===
+    st.markdown("#### CFOアドバイス（ルールベース）")
+    st.caption("財務状況から自動生成された経営アドバイス。")
 
-        f1, f2, f3 = st.columns(3)
-        f1.metric("年間売上見込み", fmt_yen(forecast_rev))
-        f2.metric("年間営業利益見込み", fmt_yen(forecast_op))
-        f3.metric("予想営業利益率", f"{(forecast_op/forecast_rev*100) if forecast_rev else 0:.1f}%")
+    advice_list = rule_based_advice(
+        df_balance, st.session_state["cf_recv"], st.session_state["cf_pay"],
+        st.session_state["cf_rec"], st.session_state["cf_balance"],
+    )
+    for i, ad in enumerate(advice_list, 1):
+        st.markdown(f"**{i}.** {ad}")
 
 
 # ==============================
